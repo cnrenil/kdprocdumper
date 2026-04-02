@@ -1,7 +1,10 @@
 #include "driver.h"
 
+#include <ntstrsafe.h>
 #include <windef.h>
+
 #include "memory.h"
+
 #define CHECK_NTSTATUS_AND_FAIL(_expr) \
     do { \
         status = (_expr); \
@@ -9,279 +12,219 @@
             KdPrintEx((0, 0, "Error encountered: %s, Status Code: 0x%X\n", #_expr, status)); \
             goto Fail; \
         } \
-    } while(0)
+    } while (0)
 
-#define CHECK_NTSTATUS(_expr) \
-	do { \
-		status = (_expr); \
-		if (!NT_SUCCESS(status)) { \
-			KdPrintEx((0, 0, "Error encountered: %s, Status Code: 0x%X\n", #_expr, status)); \
-		} \
-	} while(0)
+static NTSTATUS CompleteIrp(_In_ PIRP Irp, _In_ NTSTATUS Status, _In_ ULONG_PTR Information)
+{
+	Irp->IoStatus.Status = Status;
+	Irp->IoStatus.Information = Information;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return Status;
+}
 
+static NTSTATUS CreateModuleNameString(_In_ PINPUT_DUMP_INFO InputInfo, _Out_ PUNICODE_STRING ModuleName)
+{
+	ANSI_STRING moduleNameAnsi;
+	SIZE_T moduleNameLength;
 
-#define IOCTL_MYDEVICE_DUMP CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_MYDEVICE_IMAGESIZE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_MYDEVICE_PRINT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
+	moduleNameLength = 0;
+	while (moduleNameLength < PROC_DUMPER_MAX_MODULE_NAME && InputInfo->ModuleName[moduleNameLength] != '\0') {
+		moduleNameLength++;
+	}
 
+	if (moduleNameLength == 0 || moduleNameLength == PROC_DUMPER_MAX_MODULE_NAME) {
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	RtlInitAnsiString(&moduleNameAnsi, InputInfo->ModuleName);
+	return RtlAnsiStringToUnicodeString(ModuleName, &moduleNameAnsi, TRUE);
+}
 
 NTSTATUS DispatchCreate(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
 {
 	UNREFERENCED_PARAMETER(pDeviceObject);
-
 	KdPrint(("DispatchCreate\n"));
-
-	// Complete the IRP
-	pIrp->IoStatus.Status = STATUS_SUCCESS;
-	pIrp->IoStatus.Information = 0;
-	IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-
-	return STATUS_SUCCESS;
+	return CompleteIrp(pIrp, STATUS_SUCCESS, 0);
 }
 
 NTSTATUS DispatchClose(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
 {
 	UNREFERENCED_PARAMETER(pDeviceObject);
-
 	KdPrint(("DispatchClose\n"));
-
-	// Complete the IRP
-	pIrp->IoStatus.Status = STATUS_SUCCESS;
-	pIrp->IoStatus.Information = 0;
-	IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-
-	return STATUS_SUCCESS;
+	return CompleteIrp(pIrp, STATUS_SUCCESS, 0);
 }
 
 NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT pDeviceObject, PIRP pIrp)
 {
+	PIO_STACK_LOCATION pIoStackLocation;
+	PINPUT_DUMP_INFO pInputDumpInfoBuffer;
+	PVOID pOutBuffer;
+	PVOID mappedOutBuffer;
+	ULONG inBufferLength;
+	ULONG outBufferLength;
+	ULONG controlCode;
+	NTSTATUS status;
+	UNICODE_STRING moduleName;
+	PEPROCESS pProcess;
+	ULONG_PTR information;
+
 	UNREFERENCED_PARAMETER(pDeviceObject);
 
 	KdPrintEx((0, 0, "DispatchDeviceControl\n"));
 
-	// Get the input buffer
-	PIO_STACK_LOCATION pIoStackLocation = IoGetCurrentIrpStackLocation(pIrp);
+	pIoStackLocation = IoGetCurrentIrpStackLocation(pIrp);
+	pInputDumpInfoBuffer = (PINPUT_DUMP_INFO)pIrp->AssociatedIrp.SystemBuffer;
+	pOutBuffer = pIrp->AssociatedIrp.SystemBuffer;
+	mappedOutBuffer = NULL;
+	inBufferLength = pIoStackLocation->Parameters.DeviceIoControl.InputBufferLength;
+	outBufferLength = pIoStackLocation->Parameters.DeviceIoControl.OutputBufferLength;
+	controlCode = pIoStackLocation->Parameters.DeviceIoControl.IoControlCode;
+	status = STATUS_SUCCESS;
+	information = 0;
+	RtlZeroMemory(&moduleName, sizeof(moduleName));
+	pProcess = NULL;
 
-	// This will contain the process id of the process that must be dumped
-	PVOID pInBuffer = pIrp->AssociatedIrp.SystemBuffer;
-	ULONG inBufferLength = pIoStackLocation->Parameters.DeviceIoControl.InputBufferLength;
-
-	// Get the output buffer
-	PVOID pOutBuffer = pIrp->AssociatedIrp.SystemBuffer;
-	ULONG outBufferLength = pIoStackLocation->Parameters.DeviceIoControl.OutputBufferLength;
-
-	UNREFERENCED_PARAMETER(pOutBuffer);
-	UNREFERENCED_PARAMETER(outBufferLength);
-
-	// Get the control code
-	ULONG controlCode = pIoStackLocation->Parameters.DeviceIoControl.IoControlCode;
-
-	NTSTATUS status = STATUS_SUCCESS;
-
-	// Process the control code
 	switch (controlCode)
 	{
 	case IOCTL_MYDEVICE_DUMP:
 	{
 		KdPrintEx((0, 0, "IOCTL_MYDEVICE_DUMP\n"));
 
-		// Check if the input buffer is valid
-		if (inBufferLength != sizeof(INPUT_DUMP_INFO))
-		{
-			KdPrintEx((0, 0, "Invalid input buffer length\n"));
-			pIrp->IoStatus.Status = STATUS_INVALID_PARAMETER;
-			pIrp->IoStatus.Information = 0;
-			IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-			return STATUS_INVALID_PARAMETER;
+		if (inBufferLength < sizeof(INPUT_DUMP_INFO) || pInputDumpInfoBuffer == NULL || pIrp->MdlAddress == NULL || outBufferLength == 0) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
 		}
 
-		// Get the process id
-		PINPUT_DUMP_INFO pInputDumpInfoBuffer = pInBuffer;
-		KdPrint(("Process id: %d\n", pInputDumpInfoBuffer->ProcessId));
+		mappedOutBuffer = MmGetSystemAddressForMdlSafe(pIrp->MdlAddress, NormalPagePriority | MdlMappingNoExecute);
+		if (mappedOutBuffer == NULL) {
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
+		}
 
-		// Get the process object
-		PEPROCESS pProcess;
-		status = PsLookupProcessByProcessId((HANDLE)pInputDumpInfoBuffer->ProcessId, &pProcess);
-		if (!NT_SUCCESS(status))
-		{
+		status = PsLookupProcessByProcessId(ULongToHandle(pInputDumpInfoBuffer->ProcessId), &pProcess);
+		if (!NT_SUCCESS(status)) {
 			KdPrint(("PsLookupProcessByProcessId failed: 0x%X\n", status));
-			pIrp->IoStatus.Status = status;
-			pIrp->IoStatus.Information = 0;
-			IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-			return status;
+			break;
 		}
 
-		// Dump the process
-		KdPrintEx((0, 0, "Dumping process memory\n"));
+		status = CreateModuleNameString(pInputDumpInfoBuffer, &moduleName);
+		if (!NT_SUCCESS(status)) {
+			break;
+		}
 
-		// Find base address
-		UNICODE_STRING moduleName;
-
-		// WCHAR TO UNICODE_STRING of module name
-		ANSI_STRING moduleNameAnsi;
-		RtlInitAnsiString(&moduleNameAnsi, pInputDumpInfoBuffer->ModuleName);
-		RtlAnsiStringToUnicodeString(&moduleName, &moduleNameAnsi, TRUE);
-
-		HANDLE hFile = NULL;
-		CHECK_NTSTATUS_AND_FAIL(DumpProcessMemory(pProcess, &moduleName, pOutBuffer));
-		pIrp->IoStatus.Information = outBufferLength;
-
-		break;
-
-	Fail:
-		pIrp->IoStatus.Information = 0;
-
+		CHECK_NTSTATUS_AND_FAIL(DumpProcessMemory(pProcess, &moduleName, mappedOutBuffer, outBufferLength, &information));
 		break;
 	}
 	case IOCTL_MYDEVICE_IMAGESIZE:
 	{
+		MODULE_INFO moduleInfo;
+		KAPC_STATE apcState;
+
 		KdPrint(("IOCTL_MYDEVICE_IMAGESIZE\n"));
 
-		// Check if the input buffer is valid
-		if (inBufferLength != sizeof(INPUT_DUMP_INFO))
-		{
-			KdPrint(("Invalid input buffer length\n"));
-			pIrp->IoStatus.Status = STATUS_INVALID_PARAMETER;
-			pIrp->IoStatus.Information = 0;
-			IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-			return STATUS_INVALID_PARAMETER;
+		if (inBufferLength < sizeof(INPUT_DUMP_INFO) || pInputDumpInfoBuffer == NULL || pOutBuffer == NULL || outBufferLength < sizeof(ULONG)) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
 		}
 
-		// Get the process id
-		PINPUT_DUMP_INFO pInputImageSizeInfoBuffer = pInBuffer;
-		KdPrint(("Process id: %d\n", pInputImageSizeInfoBuffer->ProcessId));
-
-		// Get the process object
-		PEPROCESS pProcess;
-		status = PsLookupProcessByProcessId((HANDLE)pInputImageSizeInfoBuffer->ProcessId, &pProcess);
-		if (!NT_SUCCESS(status))
-		{
+		status = PsLookupProcessByProcessId(ULongToHandle(pInputDumpInfoBuffer->ProcessId), &pProcess);
+		if (!NT_SUCCESS(status)) {
 			KdPrint(("PsLookupProcessByProcessId failed: 0x%X\n", status));
-			pIrp->IoStatus.Status = status;
-			pIrp->IoStatus.Information = 0;
-			IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-			return status;
+			break;
 		}
 
-		// WCHAR TO UNICODE_STRING of module name
-		UNICODE_STRING moduleName;
-		ANSI_STRING moduleNameAnsi;
-		RtlInitAnsiString(&moduleNameAnsi, pInputImageSizeInfoBuffer->ModuleName);
-		RtlAnsiStringToUnicodeString(&moduleName, &moduleNameAnsi, TRUE);
-
-		MODULE_INFO ModuleInfo = { 0 };
-
-		KAPC_STATE ApcState = { 0 };
-		KeStackAttachProcess(pProcess, &ApcState);
-
-		GetModuleBaseAddressInfo(pProcess, &moduleName, &ModuleInfo);
-
-		KeUnstackDetachProcess(&ApcState);
-
-		// Check if moduleInfo is empty
-		if (ModuleInfo.BaseAddress == NULL)
-		{
-			pIrp->IoStatus.Status = STATUS_NOT_FOUND;
-			pIrp->IoStatus.Information = 0;
-			IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-			return STATUS_NOT_FOUND;
+		status = CreateModuleNameString(pInputDumpInfoBuffer, &moduleName);
+		if (!NT_SUCCESS(status)) {
+			break;
 		}
 
-		// Get the size of the image
-		ULONG imageSize = ModuleInfo.SizeOfImage;
-		KdPrint(("Image size: %d\n", imageSize));
+		RtlZeroMemory(&moduleInfo, sizeof(moduleInfo));
+		RtlZeroMemory(&apcState, sizeof(apcState));
 
-		// Set the output buffer
-		*(PULONG)pOutBuffer = imageSize;
-		pIrp->IoStatus.Information = sizeof(ULONG);
+			KeStackAttachProcess((PRKPROCESS)pProcess, &apcState);
+		status = GetModuleBaseAddressInfo(pProcess, &moduleName, &moduleInfo);
+		KeUnstackDetachProcess(&apcState);
 
+		if (!NT_SUCCESS(status)) {
+			break;
+		}
+
+		*(PULONG)pOutBuffer = moduleInfo.SizeOfImage;
+		information = sizeof(ULONG);
 		break;
 	}
 	case IOCTL_MYDEVICE_PRINT:
-	{
 		KdPrint(("IOCTL_MYDEVICE_PRINT\n"));
 		break;
-	}
 	default:
-	{
-		KdPrint(("Unknown IOCTL\n"));
+		status = STATUS_INVALID_DEVICE_REQUEST;
 		break;
 	}
+
+Fail:
+	if (moduleName.Buffer != NULL) {
+		RtlFreeUnicodeString(&moduleName);
 	}
 
+	if (pProcess != NULL) {
+		ObDereferenceObject(pProcess);
+	}
 
-	// Complete the IRP
-	pIrp->IoStatus.Status = status;
-	IoCompleteRequest(pIrp, IO_NO_INCREMENT);
-
-	return status;
+	return CompleteIrp(pIrp, status, information);
 }
 
-NTSTATUS DriverInitialize(_In_ struct _DRIVER_OBJECT* pDriverObject, _In_ PUNICODE_STRING pRegistryPath)
+NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath)
 {
-	UNREFERENCED_PARAMETER(pRegistryPath);
-
-	NTSTATUS status = STATUS_SUCCESS;
-
-	// Create a device object
+	NTSTATUS status;
 	PDEVICE_OBJECT pDeviceObject;
 	UNICODE_STRING devName;
-	RtlInitUnicodeString(&devName, L"\\Device\\MyDevice3");
-	status = IoCreateDevice(pDriverObject, 0, &devName, FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, TRUE,
+	UNICODE_STRING symLink;
+
+	UNREFERENCED_PARAMETER(pRegistryPath);
+
+	RtlInitUnicodeString(&devName, PROC_DUMPER_DEVICE_NAME);
+	RtlInitUnicodeString(&symLink, PROC_DUMPER_DOSDEVICE_NAME);
+
+	status = IoCreateDevice(
+		pDriverObject,
+		0,
+		&devName,
+		FILE_DEVICE_UNKNOWN,
+		FILE_DEVICE_SECURE_OPEN,
+		FALSE,
 		&pDeviceObject);
-	if (!NT_SUCCESS(status))
-	{
+	if (!NT_SUCCESS(status)) {
 		KdPrint(("IoCreateDevice failed: 0x%X\n", status));
 		return status;
 	}
 
-	// Create a symbolic link
-	UNICODE_STRING symLink;
-	RtlInitUnicodeString(&symLink, L"\\DosDevices\\MyDevice3");
 	status = IoCreateSymbolicLink(&symLink, &devName);
-	if (!NT_SUCCESS(status))
-	{
+	if (!NT_SUCCESS(status)) {
 		KdPrint(("IoCreateSymbolicLink failed: 0x%X\n", status));
 		IoDeleteDevice(pDeviceObject);
 		return status;
 	}
 
 	pDeviceObject->Flags |= DO_BUFFERED_IO;
-	pDeviceObject->Flags &= (~DO_DEVICE_INITIALIZING);
+	pDeviceObject->Flags |= DO_DIRECT_IO;
+	pDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
 
-	// Set the dispatch routines
 	pDriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreate;
 	pDriverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchClose;
 	pDriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
+	pDriverObject->DriverUnload = UnloadDriver;
 
-	return status;
+	return STATUS_SUCCESS;
 }
 
-
-NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath)
-{
-	UNREFERENCED_PARAMETER(pRegistryPath);
-	UNREFERENCED_PARAMETER(pDriverObject);
-
-	NTSTATUS status = STATUS_SUCCESS;
-	UNICODE_STRING drvName;
-
-	RtlInitUnicodeString(&drvName, L"\\Driver\\MyDriver3");
-
-	// Create a driver object
-
-	// This is a manual mapped driver, so we need to create a driver object and device object
-	status = IoCreateDriver(&drvName, &DriverInitialize);
-
-	return status;
-}
-
-
-NTSTATUS UnloadDriver(PDRIVER_OBJECT pDriverObject)
+VOID UnloadDriver(PDRIVER_OBJECT pDriverObject)
 {
 	UNICODE_STRING symLink;
-	RtlInitUnicodeString(&symLink, L"\\DosDevices\\MyDevice3");
+
+	RtlInitUnicodeString(&symLink, PROC_DUMPER_DOSDEVICE_NAME);
 	IoDeleteSymbolicLink(&symLink);
-	IoDeleteDevice(pDriverObject->DeviceObject);
-	return STATUS_SUCCESS;
+
+	if (pDriverObject->DeviceObject != NULL) {
+		IoDeleteDevice(pDriverObject->DeviceObject);
+	}
 }

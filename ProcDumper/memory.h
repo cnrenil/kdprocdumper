@@ -1,6 +1,6 @@
 #pragma once
 #include <ntdef.h>
-#include <ntddk.h>
+#include <ntifs.h>
 #include <windef.h>
 
 #define IMAGE_DOS_SIGNATURE                 0x5A4D      // MZ
@@ -17,68 +17,26 @@ typedef struct _MODULE_INFO {
 	UNICODE_STRING BaseDllName;
 } MODULE_INFO, * PMODULE_INFO;
 
-#if (NTDDI_VERSION >= NTDDI_WIN2K)
-typedef enum _MEMORY_INFORMATION_CLASS {
-    MemoryBasicInformation
-} MEMORY_INFORMATION_CLASS;
+// Use the WDK declarations for virtual-memory and APC types/APIs to avoid
+// local drift across SDK/WDK releases.
+#if defined(_WIN64)
+C_ASSERT(sizeof(MEMORY_BASIC_INFORMATION) == 48);
+#else
+C_ASSERT(sizeof(MEMORY_BASIC_INFORMATION) == 28);
 #endif
 
-#if (NTDDI_VERSION >= NTDDI_WIN2K)
-//@[comment("MVI_tracked")]
+// Not declared by current WDK kernel headers, but exported by ntoskrnl.
 _IRQL_requires_max_(PASSIVE_LEVEL)
-_Must_inspect_result_
 NTSYSAPI
 NTSTATUS
 NTAPI
-ZwQueryVirtualMemory(
+ZwProtectVirtualMemory(
     _In_ HANDLE ProcessHandle,
-    _In_opt_ PVOID BaseAddress,
-    _In_ MEMORY_INFORMATION_CLASS MemoryInformationClass,
-    _Out_writes_bytes_(MemoryInformationLength) PVOID MemoryInformation,
-    _In_ SIZE_T MemoryInformationLength,
-    _Out_opt_ PSIZE_T ReturnLength
+    _Inout_ PVOID* BaseAddress,
+    _Inout_ PSIZE_T RegionSize,
+    _In_ ULONG NewProtect,
+    _Out_ PULONG OldProtect
 );
-#endif
-
-typedef struct _KAPC_STATE {
-    LIST_ENTRY ApcListHead[MaximumMode];
-    struct _KPROCESS* Process;
-    union {
-        UCHAR InProgressFlags;
-        struct {
-            BOOLEAN KernelApcInProgress : 1;
-            BOOLEAN SpecialApcInProgress : 1;
-        };
-    };
-
-    BOOLEAN KernelApcPending;
-    union {
-        BOOLEAN UserApcPendingAll;
-        struct {
-            BOOLEAN SpecialUserApcPending : 1;
-            BOOLEAN UserApcPending : 1;
-        };
-    };
-} KAPC_STATE, * PKAPC_STATE, * PRKAPC_STATE;
-
-#if (NTDDI_VERSION >= NTDDI_WIN2K)
-_IRQL_requires_max_(APC_LEVEL)
-NTKERNELAPI
-VOID
-KeStackAttachProcess(
-    _Inout_ PRKPROCESS PROCESS,
-    _Out_ PRKAPC_STATE ApcState
-);
-#endif
-
-#if (NTDDI_VERSION >= NTDDI_WIN2K)
-_IRQL_requires_max_(APC_LEVEL)
-NTKERNELAPI
-VOID
-KeUnstackDetachProcess(
-    _In_ PRKAPC_STATE ApcState
-);
-#endif
 
 typedef
 VOID
@@ -226,4 +184,4 @@ NTSTATUS KeReadVirtualMemory(PEPROCESS Process, PVOID SourceAddress, PVOID Targe
 
 NTSTATUS GetModuleBaseAddressInfo(PEPROCESS Process, PUNICODE_STRING ModuleName, PMODULE_INFO BaseAddress);
 
-NTSTATUS DumpProcessMemory(IN PEPROCESS Process, IN PUNICODE_STRING ModuleName, OUT PVOID OutBuffer);
+NTSTATUS DumpProcessMemory(IN PEPROCESS Process, IN PUNICODE_STRING ModuleName, OUT PVOID OutBuffer, IN SIZE_T OutBufferSize, OUT PSIZE_T BytesWritten);
