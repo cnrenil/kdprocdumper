@@ -18,5 +18,18 @@
     <ClCompile Include="UMProcDumper.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="service.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="targets.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="pe.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="dump.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="tui.cpp"><Filter>Source Files</Filter></ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="common.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="service.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="targets.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="pe.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="dump.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="tui.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
 </Project>

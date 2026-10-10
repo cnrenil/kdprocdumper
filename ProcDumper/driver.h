@@ -1,53 +1,11 @@
 #pragma once
-
 #include <ntifs.h>
-
-#define PROC_DUMPER_DEVICE_NAME L"\\Device\\ProcDumper"
-#define PROC_DUMPER_DOSDEVICE_NAME L"\\DosDevices\\ProcDumper"
-#define PROC_DUMPER_WIN32_NAME L"\\\\.\\ProcDumper"
-
-#define PROC_DUMPER_MAX_MODULE_NAME 260
-
-#define IOCTL_MYDEVICE_DUMP CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
-#define IOCTL_MYDEVICE_IMAGESIZE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_MYDEVICE_PRINT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-typedef struct _INPUT_DUMP_INFO
-{
-	ULONG ProcessId;
-	CHAR ModuleName[PROC_DUMPER_MAX_MODULE_NAME];
-} INPUT_DUMP_INFO, * PINPUT_DUMP_INFO;
-
-EXTERN_C_START
-NTSTATUS NTAPI MmCopyVirtualMemory
-(
-	IN PEPROCESS SourceProcess,
-	IN PVOID SourceAddress,
-	IN PEPROCESS TargetProcess,
-	OUT PVOID TargetAddress,
-	IN SIZE_T BufferSize,
-	IN KPROCESSOR_MODE PreviousMode,
-	OUT PSIZE_T ReturnSize
-);
-
-NTKERNELAPI
-PPEB
-PsGetProcessPeb(
-	__in PEPROCESS Process
-);
-
-
-
-_Must_inspect_result_
-_IRQL_requires_max_(APC_LEVEL)
-NTKERNELAPI
-NTSTATUS
-PsLookupProcessByProcessId(
-	_In_ HANDLE ProcessId,
-	_Outptr_ PEPROCESS* Process
-);
-EXTERN_C_END
-
-NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegistryPath);
-
-VOID UnloadDriver(PDRIVER_OBJECT pDriverObject);
+#include "../shared/protocol.h"
+#define KD_POOL_TAG 'pDdK'
+typedef struct _KD_SESSION {
+    // A kernel handle keeps the process object alive and avoids PID reuse.
+    HANDLE Process;
+    KD_IMAGE Image;
+} KD_SESSION;
+DRIVER_INITIALIZE DriverEntry;
+DRIVER_UNLOAD UnloadDriver;

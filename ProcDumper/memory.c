@@ -1,273 +1,136 @@
 #include "memory.h"
-#include "driver.h"
+#include <ntimage.h>
 
-#define KDPROC_PROCESS_VM_OPERATION 0x0008
-#define KDPROC_PROCESS_VM_READ      0x0010
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION 0x0400
+#endif
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ 0x0010
+#endif
+#ifndef MEM_IMAGE
+#define MEM_IMAGE 0x01000000
+#endif
 
-#define PAGE_READABLE_MASK (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
-
-static BOOLEAN IsReadableProtection(_In_ ULONG Protect)
+static BOOLEAN UserRange(ULONGLONG Address, SIZE_T Length)
 {
-	ULONG effectiveProtect = Protect & ~(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE);
-	return (effectiveProtect & PAGE_READABLE_MASK) != 0;
+    ULONGLONG highest = (ULONGLONG)(ULONG_PTR)MmHighestUserAddress;
+    return Address >= 0x10000 && Address <= highest && Length != 0 && Length - 1 <= highest - Address;
 }
 
-static NTSTATUS CopyRegionWithTemporaryProtection(
-	_In_ HANDLE ProcessHandle,
-	_In_ PEPROCESS Process,
-	_In_ PUCHAR SourceAddress,
-	_Out_writes_bytes_(RegionSize) PUCHAR TargetAddress,
-	_In_ SIZE_T RegionSize,
-	_In_ ULONG OriginalProtect)
+static NTSTATUS CopyAttached(PVOID Target, ULONGLONG Source, SIZE_T Length, PSIZE_T Copied)
 {
-	NTSTATUS status;
-	PVOID protectBase;
-	SIZE_T protectSize;
-	ULONG oldProtect;
-	BOOLEAN protectionChanged;
-
-	protectBase = SourceAddress;
-	protectSize = RegionSize;
-	oldProtect = 0;
-	protectionChanged = FALSE;
-
-	if (!IsReadableProtection(OriginalProtect) || (OriginalProtect & PAGE_GUARD) != 0) {
-		status = ZwProtectVirtualMemory(ProcessHandle, &protectBase, &protectSize, PAGE_EXECUTE_READWRITE, &oldProtect);
-		if (!NT_SUCCESS(status)) {
-			KdPrintEx((0, 0, "ZwProtectVirtualMemory failed: 0x%X\n", status));
-			return status;
-		}
-		protectionChanged = TRUE;
-	}
-
-	status = KeReadVirtualMemory(Process, SourceAddress, TargetAddress, RegionSize);
-
-	if (protectionChanged) {
-		ULONG ignoredProtect;
-		PVOID restoreBase = SourceAddress;
-		SIZE_T restoreSize = RegionSize;
-
-		if (!NT_SUCCESS(ZwProtectVirtualMemory(ProcessHandle, &restoreBase, &restoreSize, OriginalProtect, &ignoredProtect))) {
-			KdPrintEx((0, 0, "Failed to restore memory protection for %p\n", SourceAddress));
-		}
-	}
-
-	return status;
+    MM_COPY_ADDRESS address;
+    address.VirtualAddress = (PVOID)(ULONG_PTR)Source;
+    return MmCopyMemory(Target, address, Length, MM_COPY_MEMORY_VIRTUAL, Copied);
 }
 
-
-NTSTATUS KeWriteVirtualMemory(PEPROCESS Process, PVOID SourceAddress, PVOID TargetAddress, SIZE_T Size)
+NTSTATUS KdSelectImage(KD_SESSION* Session, const KD_SELECT* Request)
 {
-	SIZE_T Bytes;
-	if (NT_SUCCESS(MmCopyVirtualMemory(PsGetCurrentProcess(), SourceAddress, Process, TargetAddress, Size, KernelMode, &Bytes)))
-		return STATUS_SUCCESS;
-
-	return STATUS_UNSUCCESSFUL;
+    PEPROCESS process = NULL;
+    HANDLE handle = NULL;
+    KAPC_STATE apc;
+    NTSTATUS status;
+    MEMORY_BASIC_INFORMATION mbi;
+    IMAGE_DOS_HEADER dos = {0};
+    IMAGE_NT_HEADERS64 nt = {0};
+    SIZE_T copied = 0;
+    ULONG imageSize = 0;
+    KD_IMAGE image = {0};
+    // Failed selection invalidates the previous target.
+    if (Session->Process != NULL) ZwClose(Session->Process);
+    RtlZeroMemory(Session, sizeof(*Session));
+    if (Request->Version != KD_PROTOCOL_VERSION || Request->ProcessId == 0 ||
+        !UserRange(Request->BaseAddress, sizeof(dos))) return STATUS_INVALID_PARAMETER;
+    status = PsLookupProcessByProcessId(ULongToHandle(Request->ProcessId), &process);
+    if (!NT_SUCCESS(status)) return status;
+    status = ObOpenObjectByPointer(process, OBJ_KERNEL_HANDLE, NULL,
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, *PsProcessType, KernelMode, &handle);
+    if (!NT_SUCCESS(status)) { ObDereferenceObject(process); return status; }
+    KeStackAttachProcess((PRKPROCESS)process, &apc);
+    // Only an image allocation may be selected; no PEB offsets or user pointers are trusted.
+    status = ZwQueryVirtualMemory(handle, (PVOID)(ULONG_PTR)Request->BaseAddress,
+        MemoryBasicInformation, &mbi, sizeof(mbi), NULL);
+    if (NT_SUCCESS(status) && (mbi.Type != MEM_IMAGE || mbi.State != MEM_COMMIT ||
+        (ULONGLONG)(ULONG_PTR)mbi.AllocationBase != Request->BaseAddress)) status = STATUS_INVALID_ADDRESS;
+    if (NT_SUCCESS(status)) status = CopyAttached(&dos, Request->BaseAddress, sizeof(dos), &copied);
+    if (NT_SUCCESS(status) && (copied != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE ||
+        dos.e_lfanew < (LONG)sizeof(dos) || dos.e_lfanew > 1024 * 1024 ||
+        !UserRange(Request->BaseAddress, (SIZE_T)dos.e_lfanew + sizeof(nt)))) status = STATUS_INVALID_IMAGE_FORMAT;
+    if (NT_SUCCESS(status)) status = CopyAttached(&nt, Request->BaseAddress + dos.e_lfanew, sizeof(nt), &copied);
+    if (NT_SUCCESS(status)) {
+        if (copied != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE ||
+            (nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC &&
+             nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)) status = STATUS_INVALID_IMAGE_FORMAT;
+        else {
+            // SizeOfImage has the same offset in PE32 and PE32+ optional headers.
+            imageSize = nt.OptionalHeader.SizeOfImage;
+            if (imageSize < (ULONG)dos.e_lfanew + sizeof(nt) || imageSize > KD_MAX_IMAGE ||
+                !UserRange(Request->BaseAddress, imageSize)) status = STATUS_INVALID_IMAGE_FORMAT;
+        }
+    }
+    KeUnstackDetachProcess(&apc);
+    ObDereferenceObject(process);
+    if (!NT_SUCCESS(status)) { ZwClose(handle); return status; }
+    image.BaseAddress = Request->BaseAddress;
+    image.SizeOfImage = imageSize;
+    image.Machine = nt.FileHeader.Machine;
+    Session->Process = handle;
+    Session->Image = image;
+    return STATUS_SUCCESS;
 }
 
-NTSTATUS KeReadVirtualMemory(PEPROCESS Process, PVOID SourceAddress, PVOID TargetAddress, SIZE_T Size)
+NTSTATUS KdReadImage(KD_SESSION* Session, const KD_READ* Request, KD_READ_RESULT* Result, PUCHAR Data)
 {
-	SIZE_T Bytes;
-	if (NT_SUCCESS(MmCopyVirtualMemory(Process, SourceAddress, PsGetCurrentProcess(), TargetAddress, Size, KernelMode, &Bytes)))
-		return STATUS_SUCCESS;
-
-	return STATUS_UNSUCCESSFUL;
-}
-
-NTSTATUS GetModuleBaseAddressInfo(PEPROCESS Process, PUNICODE_STRING ModuleName, PMODULE_INFO BaseAddress)
-{
-	NTSTATUS Status;
-	PPEB Peb;
-	PPEB_LDR_DATA Ldr;
-	PLDR_DATA_TABLE_ENTRY Module;
-	PLIST_ENTRY ModuleList;
-
-	Status = STATUS_SUCCESS;
-	MODULE_INFO ModuleInfo = { 0 };
-
-	Peb = PsGetProcessPeb(Process);
-	if (Peb == NULL)
-		return STATUS_UNSUCCESSFUL;
-
-
-	Ldr = (PPEB_LDR_DATA)Peb->Ldr;
-	if (Ldr == NULL)
-		return STATUS_UNSUCCESSFUL;
-
-	ModuleList = &Ldr->InMemoryOrderModuleList;
-	ModuleList = ModuleList->Flink;
-
-	while (ModuleList != &Ldr->InMemoryOrderModuleList)
-	{
-		Module = CONTAINING_RECORD(ModuleList, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-		ModuleList = ModuleList->Flink;
-
-		// print module dll name
-
-		KdPrintEx((0, 0, "Module: %wZ\n", Module->BaseDllName));
-		if (RtlCompareUnicodeString(&Module->BaseDllName, ModuleName, TRUE) == 0)
-		{
-			ModuleInfo.BaseAddress = Module->DllBase;
-			ModuleInfo.EntryPoint = Module->EntryPoint;
-			ModuleInfo.SizeOfImage = Module->SizeOfImage;
-			ModuleInfo.FullDllName = Module->FullDllName;
-			ModuleInfo.BaseDllName = Module->BaseDllName;
-			break;
-		}
-	}
-
-	// Check if moduleInfo is empty
-	if (ModuleInfo.BaseAddress == NULL)
-	{
-		return STATUS_NOT_FOUND;
-	}
-
-	*BaseAddress = ModuleInfo;
-	return Status;
-}
-
-
-NTSTATUS DumpProcessMemory(IN PEPROCESS Process, IN PUNICODE_STRING ModuleName, OUT PVOID OutBuffer, IN SIZE_T OutBufferSize, OUT PSIZE_T BytesWritten)
-{
-	NTSTATUS Status = STATUS_UNSUCCESSFUL;
-	MODULE_INFO BaseAddressInfo = { 0 };
-	KAPC_STATE ApcState = { 0 };
-	BOOLEAN attached = FALSE;
-	HANDLE processHandle = NULL;
-
-	if (BytesWritten != NULL)
-	{
-		*BytesWritten = 0;
-	}
-	__try {
-		__try {
-			OBJECT_ATTRIBUTES objectAttributes;
-			CLIENT_ID clientId;
-			PUCHAR moduleBase;
-			SIZE_T moduleSize;
-			SIZE_T copiedBytes;
-
-			if (OutBuffer == NULL || OutBufferSize == 0 || BytesWritten == NULL)
-			{
-				Status = STATUS_INVALID_PARAMETER;
-				__leave;
-			}
-
-			KeStackAttachProcess((PRKPROCESS)Process, &ApcState);
-			attached = TRUE;
-			Status = GetModuleBaseAddressInfo(Process, ModuleName, &BaseAddressInfo);
-			if (!NT_SUCCESS(Status))
-			{
-				KdPrintEx((0, 0, "GetModuleBaseAddress failed: 0x%X\n", Status));
-				__leave;
-			}
-
-			if (BaseAddressInfo.SizeOfImage > OutBufferSize)
-			{
-				Status = STATUS_BUFFER_TOO_SMALL;
-				__leave;
-			}
-
-			KeUnstackDetachProcess(&ApcState);
-			attached = FALSE;
-
-			InitializeObjectAttributes(&objectAttributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-			clientId.UniqueProcess = PsGetProcessId(Process);
-			clientId.UniqueThread = NULL;
-
-			Status = ZwOpenProcess(&processHandle, KDPROC_PROCESS_VM_OPERATION | KDPROC_PROCESS_VM_READ, &objectAttributes, &clientId);
-			if (!NT_SUCCESS(Status))
-			{
-				KdPrintEx((0, 0, "ZwOpenProcess failed: 0x%X\n", Status));
-				__leave;
-			}
-
-			moduleBase = (PUCHAR)BaseAddressInfo.BaseAddress;
-			moduleSize = BaseAddressInfo.SizeOfImage;
-			copiedBytes = 0;
-			RtlZeroMemory(OutBuffer, moduleSize);
-
-			KdPrintEx((0, 0, "Base address: 0x%p\n", BaseAddressInfo.BaseAddress));
-
-			while (copiedBytes < moduleSize)
-			{
-				MEMORY_BASIC_INFORMATION mbi;
-				PUCHAR currentAddress;
-				SIZE_T remainingBytes;
-				SIZE_T regionOffset;
-				SIZE_T regionBytes;
-
-				currentAddress = moduleBase + copiedBytes;
-				remainingBytes = moduleSize - copiedBytes;
-				RtlZeroMemory(&mbi, sizeof(mbi));
-
-				Status = ZwQueryVirtualMemory(processHandle, currentAddress, MemoryBasicInformation, &mbi, sizeof(mbi), NULL);
-				if (!NT_SUCCESS(Status))
-				{
-					KdPrintEx((0, 0, "ZwQueryVirtualMemory failed at %p: 0x%X\n", currentAddress, Status));
-					__leave;
-				}
-
-				if (mbi.RegionSize == 0)
-				{
-					Status = STATUS_UNSUCCESSFUL;
-					__leave;
-				}
-
-				regionOffset = (SIZE_T)(currentAddress - (PUCHAR)mbi.BaseAddress);
-				if (regionOffset >= mbi.RegionSize)
-				{
-					Status = STATUS_UNSUCCESSFUL;
-					__leave;
-				}
-
-				regionBytes = mbi.RegionSize - regionOffset;
-				if (regionBytes > remainingBytes)
-				{
-					regionBytes = remainingBytes;
-				}
-
-				if (mbi.State != MEM_COMMIT)
-				{
-					copiedBytes += regionBytes;
-					continue;
-				}
-
-				Status = CopyRegionWithTemporaryProtection(
-					processHandle,
-					Process,
-					currentAddress,
-					(PUCHAR)OutBuffer + copiedBytes,
-					regionBytes,
-					mbi.Protect);
-				if (!NT_SUCCESS(Status))
-				{
-					KdPrintEx((0, 0, "CopyRegionWithTemporaryProtection failed at %p: 0x%X\n", currentAddress, Status));
-					__leave;
-				}
-
-				copiedBytes += regionBytes;
-			}
-
-			*BytesWritten = moduleSize;
-			Status = STATUS_SUCCESS;
-		}
-		__except (EXCEPTION_EXECUTE_HANDLER) {
-			Status = GetExceptionCode();
-			KdPrintEx((0, 0, "Exception: 0x%X\n", Status));
-		}
-	}
-	__finally {
-		if (processHandle != NULL)
-		{
-			ZwClose(processHandle);
-		}
-
-		if (attached)
-		{
-			KeUnstackDetachProcess(&ApcState);
-		}
-
-		return Status;
-	}
+    PEPROCESS process;
+    KAPC_STATE apc;
+    NTSTATUS status;
+    ULONG offset = 0, copiedTotal = 0;
+    if (Session->Process == NULL) return STATUS_INVALID_DEVICE_STATE;
+    if (Request->Length == 0 || Request->Length > KD_MAX_CHUNK ||
+        Request->Offset >= Session->Image.SizeOfImage ||
+        Request->Length > Session->Image.SizeOfImage - Request->Offset) return STATUS_INVALID_PARAMETER;
+    status = ObReferenceObjectByHandle(Session->Process, PROCESS_VM_READ, *PsProcessType,
+        KernelMode, (PVOID*)&process, NULL);
+    if (!NT_SUCCESS(status)) return status;
+    RtlZeroMemory(Result, sizeof(*Result));
+    RtlZeroMemory(Data, Request->Length);
+    KeStackAttachProcess((PRKPROCESS)process, &apc);
+    while (offset < Request->Length) {
+        MEMORY_BASIC_INFORMATION mbi;
+        ULONGLONG source = Session->Image.BaseAddress + Request->Offset + offset;
+        SIZE_T regionOffset, length, copied = 0;
+        status = ZwQueryVirtualMemory(Session->Process, (PVOID)(ULONG_PTR)source,
+            MemoryBasicInformation, &mbi, sizeof(mbi), NULL);
+        if (!NT_SUCCESS(status)) {
+            // The image can be concurrently unmapped or page out between requests.
+            // Preserve the fixed-size stream contract by zero-filling one page and continue.
+            length = min((SIZE_T)PAGE_SIZE, Request->Length - offset);
+            offset += (ULONG)length;
+            status = STATUS_SUCCESS;
+            continue;
+        }
+        regionOffset = (SIZE_T)(source - (ULONGLONG)(ULONG_PTR)mbi.BaseAddress);
+        if (regionOffset >= mbi.RegionSize) { status = STATUS_INVALID_ADDRESS; break; }
+        length = min(mbi.RegionSize - regionOffset, Request->Length - offset);
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+            (ULONGLONG)(ULONG_PTR)mbi.AllocationBase == Session->Image.BaseAddress &&
+            !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            // Copy a whole region; after a raced-out page continue at the next page.
+            status = CopyAttached(Data + offset, source, length, &copied);
+            copiedTotal += (ULONG)copied;
+            if (copied < length) {
+                SIZE_T skip = PAGE_SIZE - (SIZE_T)((source + copied) & (PAGE_SIZE - 1));
+                length = min(length, copied + skip);
+            }
+        }
+        offset += (ULONG)length;
+        status = STATUS_SUCCESS;
+    }
+    KeUnstackDetachProcess(&apc);
+    ObDereferenceObject(process);
+    if (!NT_SUCCESS(status)) return status;
+    Result->Length = Request->Length;
+    Result->Copied = copiedTotal;
+    Result->Missing = Request->Length - copiedTotal;
+    return STATUS_SUCCESS;
 }
